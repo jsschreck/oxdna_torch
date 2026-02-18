@@ -1,10 +1,6 @@
 # oxdna_torch
 
-<<<<<<< HEAD
 A fully differentiable PyTorch reimplementation of the **oxDNA1 coarse-grained DNA model**. Forces and torques are computed via automatic differentiation, so gradients flow through the physics — enabling backpropagation through molecular dynamics trajectories. oxDNA2 support coming soon.
-=======
-A fully differentiable PyTorch reimplementation of the **oxDNA1 coarse-grained DNA model**. Forces and torques are computed via automatic differentiation, so gradients flow through the physics — enabling backpropagation through molecular dynamics trajectories.
->>>>>>> a8f66c95bfb1316f119042950d340ca7aadfb871
 
 ## Features
 
@@ -94,7 +90,6 @@ Key parameters:
 
 For backprop through time, pass `create_graph=True` to `step()` or `rollout()`. For memory-efficient BPTT on long trajectories, use `checkpoint_every=N` in `rollout()`.
 
-<<<<<<< HEAD
 ## Performance and Rollouts
 
 `oxdna_torch` is fully differentiable, but long sequential simulations remain significantly slower than standard C++ oxDNA due to computation graph overhead and Python interpreter latency. The following items outline some optimization priorities:
@@ -112,8 +107,6 @@ For backprop through time, pass `create_graph=True` to `step()` or `rollout()`. 
 * **Reduce Tensor Churn**: Pre-allocate memory for interaction site offsets and increase the use of in-place operations (e.g., `pos.add_`) during drift steps to reduce pressure on the PyTorch caching allocator.
 
 
-=======
->>>>>>> a8f66c95bfb1316f119042950d340ca7aadfb871
 ## Learnable Parameters
 
 Any physical constant in the potential can be made a gradient-tracked `nn.Parameter` by passing its name to `OxDNAEnergy`:
