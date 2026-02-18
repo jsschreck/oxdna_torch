@@ -9,4 +9,5 @@ dependencies:
   - pytest
   - flake8
   - pip:
+    - oxDNA-analysis-tools
     - -e .
