@@ -165,8 +165,8 @@ def test_oxrna_energy_components():
     model, _, state = _make_model()
     comps = model.energy_components(state)
     required_keys = {'fene', 'bonded_excl', 'stacking',
-                     'nonbonded_excl', 'hbond', 'cross_stacking',
-                     'coaxial_stack', 'total'}
+                     'nonbonded_excl', 'hbond', 'mismatch_repulsion',
+                     'cross_stacking', 'coaxial_stack', 'total'}
     assert required_keys == set(comps.keys())
     # Total should match sum of parts
     parts_sum = sum(v for k, v in comps.items() if k != 'total')

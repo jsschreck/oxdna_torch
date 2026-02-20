@@ -1,5 +1,7 @@
 # oxdna_torch
 
+> **Warning:** This codebase is experimental and under active development. There are likely bugs. Use with caution and validate results against the reference C++ oxDNA implementation before drawing scientific conclusions.
+
 A fully differentiable PyTorch reimplementation of the **oxDNA** and **oxRNA** coarse-grained nucleic acid models. Forces and torques are obtained via automatic differentiation, so gradients flow through the physics — enabling backpropagation through molecular dynamics trajectories and gradient-based parameter optimisation.
 
 ## Models
@@ -8,7 +10,7 @@ A fully differentiable PyTorch reimplementation of the **oxDNA** and **oxRNA** c
 |-------|-------|-------------------|
 | **oxDNA1** | `OxDNAEnergy` | FENE, excl. vol., stacking, H-bond, cross-stacking, coaxial stacking |
 | **oxDNA2** | `OxDNAEnergy(use_oxdna2=True)` | All oxDNA1 terms + Debye–Hückel electrostatics + major/minor-groove geometry |
-| **oxRNA1** | `OxRNAEnergy` | RNA-specific FENE, excl. vol., stacking (asymmetric STACK_3/STACK_5 sites), H-bond, cross-stacking, coaxial stacking |
+| **oxRNA1** | `OxRNAEnergy` | RNA-specific FENE, excl. vol., stacking (asymmetric STACK_3/STACK_5 sites), H-bond, cross-stacking, coaxial stacking. Optional oxRNA2 mismatch repulsion via `mismatch_repulsion=True`. Debye–Hückel electrostatics (full oxRNA2) not yet implemented. |
 
 All three models support:
 - **Sequence-averaged** or **sequence-dependent** stacking / H-bond parameters
@@ -21,7 +23,7 @@ All three models support:
 
 - **Complete potentials** — every interaction term from the published oxDNA1, oxDNA2, and oxRNA1 models, validated against the reference C++ implementation
 - **Inertial Langevin integrator** — velocity-Verlet + Langevin thermostat matching the `MD_CPUBackend` in reference oxDNA C++, with correct torque derivation from quaternion gradients
-- **Backprop through time** — `create_graph=True` keeps the autograd graph across integration steps; optional gradient checkpointing trades compute for memory on long trajectories
+- **Backprop through time** — `create_graph=True` keeps the autograd graph across integration steps; `save_every=N` + `create_graph=True` builds the graph only at saved steps (burn-in runs under `no_grad`) for decorrelated, memory-efficient sampling; optional gradient checkpointing trades compute for memory on long trajectories
 - **Neighbour-list caching** — `set_nl_skin(skin)` reuses the pair list across steps until any particle drifts more than `skin/2`, reducing NL rebuilds during dynamics
 - **TorchMD-Net NL backend** — drop-in replacement neighbour kernel (`set_nl_backend('torchmdnet')`) that dispatches to a Triton-fused GPU kernel when CUDA is available, or pure-PyTorch on CPU
 - **`torch.compile` support** — call `model.compile()` to apply `torch.compile` to the energy model for faster rollouts
@@ -68,14 +70,15 @@ model = OxDNAEnergy(
 energy = model(state)
 components = model.energy_components(state)
 for name, val in components.items():
-    print(f"  {name:25s}: {val.item():+.4f}")
+    print(f"  {name:25s}: {val:+.4f}")   # values are floats
 
 # Compute forces via autograd
 forces = model.compute_forces(state)   # (N, 3)
 
-# Run Langevin dynamics
+# Run Langevin dynamics — returns a List[SystemState]
 integrator = LangevinIntegrator(model, dt=0.003, gamma=1.0, temperature=0.1113)
 trajectory = integrator.rollout(state, n_steps=1000)
+final_state = trajectory[-1]
 ```
 
 ## Quick Start — oxDNA2
@@ -99,7 +102,7 @@ model = OxDNAEnergy(
 
 ```python
 import torch
-from oxdna_torch import load_rna_system, OxRNAEnergy
+from oxdna_torch import load_rna_system, OxRNAEnergy, SystemState
 from oxdna_torch.integrator import LangevinIntegrator
 
 # Load an RNA system (supports letter codes A/C/G/U and native integer btype codes)
@@ -112,24 +115,27 @@ T_red = (273.15 + 25) / 3000.0
 model = OxRNAEnergy(
     topology,
     temperature=T_red,
-    seq_dependent=True,   # use published RNA sequence-dependent parameters
+    seq_dependent=True,              # use published RNA sequence-dependent parameters
+    mismatch_repulsion=True,         # repulsive bump for non-Watson-Crick pairs (oxRNA2)
+    mismatch_repulsion_strength=1.0, # strength of mismatch repulsion
 )
 
-# Per-term energy breakdown
+# Per-term energy breakdown — values are floats
 components = model.energy_components(state)
 for name, val in components.items():
-    print(f"  {name:20s}: {val.item():+.4f}")
+    print(f"  {name:20s}: {val:+.4f}")
 
 # Forces via autograd
 pos = state.positions.detach().requires_grad_(True)
-s = state.__class__(positions=pos, quaternions=state.quaternions.detach(),
-                    box=state.box)
+s = SystemState(positions=pos, quaternions=state.quaternions.detach(),
+                box=state.box)
 model(s).backward()
 forces = -pos.grad   # (N, 3)
 
-# Langevin MD
+# Langevin MD — returns a List[SystemState]
 integrator = LangevinIntegrator(model, dt=0.003, gamma=1.0, temperature=T_red)
 trajectory = integrator.rollout(state, n_steps=500)
+final_state = trajectory[-1]
 ```
 
 The `examples/RNA_MD/` directory contains a 132-nucleotide single-stranded RNA snapshot (`prova.top` / `prova.dat`) generated with oxRNA2 MD at 25 °C, suitable for validation.
@@ -186,7 +192,52 @@ Key parameters:
 | `mass` | Particle mass | `1.0` |
 | `inertia` | Moment of inertia | `1.0` |
 
-For backprop through time, pass `create_graph=True` to `step()` or `rollout()`. For memory-efficient BPTT on long trajectories, use `checkpoint_every=N` in `rollout()`.
+### Backprop Through Time (BPTT)
+
+Pass `create_graph=True` to `step()` or `rollout()` to keep the autograd graph across integration steps:
+
+```python
+trajectory = integrator.rollout(state, n_steps=100, create_graph=True)
+loss = some_loss(trajectory)
+loss.backward()   # gradients flow through every step
+```
+
+For memory-efficient BPTT on long trajectories, use `checkpoint_every=N` to recompute activations during the backward pass instead of storing them:
+
+```python
+trajectory = integrator.rollout(state, n_steps=1000,
+                                create_graph=True, checkpoint_every=50)
+```
+
+### Decorrelated Sampling with `save_every`
+
+MD configurations are highly correlated between adjacent steps. For gradient-based learning it is often better to collect a set of *decorrelated* snapshots rather than every consecutive step.
+
+Set `save_every=N` to save one state every *N* steps. Only the saved states appear in the returned trajectory:
+
+```python
+# Save 10 decorrelated snapshots from 10 000 steps
+trajectory = integrator.rollout(state, n_steps=10_000, save_every=1000)
+# len(trajectory) == 11  (initial + 10 saved states)
+```
+
+**Memory optimisation when combined with `create_graph=True`:**
+When `save_every > 1` and `create_graph=True`, the integrator automatically runs the intermediate *burn-in* steps as pure inference (`torch.no_grad()`). The autograd graph is only built for the single step leading to each saved state. The state is detached before each graph step so gradients do not flow through the no-grad burn-in steps. This avoids storing the full computational graph for every intermediate step:
+
+```python
+# Collect 10 decorrelated, gradient-connected snapshots.
+# Only 10 graph steps are materialised (one per saved state),
+# not 10 000, so memory scales with save_every rather than n_steps.
+trajectory = integrator.rollout(
+    state, n_steps=10_000,
+    save_every=1000,
+    create_graph=True,
+)
+loss = sum(some_loss(s) for s in trajectory[1:])
+loss.backward()   # gradients flow through each saved step only
+```
+
+With `save_every=1` (default) the classic full-graph BPTT behaviour is preserved — every step carries the autograd graph.
 
 ## Learnable Parameters
 

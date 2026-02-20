@@ -2,14 +2,28 @@
 Tests for the integrator module (dynamics and backprop through time).
 """
 
+import math
+import os
+
 import torch
 import pytest
 
 from oxdna_torch.model import OxDNAEnergy
 from oxdna_torch.state import SystemState
-from oxdna_torch.integrator import LangevinIntegrator
+from oxdna_torch.integrator import LangevinIntegrator, VelocityVerletIntegrator
 
 from conftest import T_334K
+
+
+# ---------------------------------------------------------------------------
+# Paths to example files used by stability tests
+# ---------------------------------------------------------------------------
+_HERE = os.path.dirname(__file__)
+_ROOT = os.path.join(_HERE, "..")
+
+_RNA_TOP  = os.path.join(_ROOT, "examples", "RNA_MD", "prova.top")
+_RNA_CONF = os.path.join(_ROOT, "examples", "RNA_MD", "prova.dat")
+_rna_files_exist = os.path.isfile(_RNA_TOP) and os.path.isfile(_RNA_CONF)
 
 
 class TestLangevinIntegrator:
@@ -261,3 +275,166 @@ class TestRollout:
 
         # initial + steps 5 and 10
         assert len(trajectory) == 3
+
+
+class TestStability:
+    """Longer integration runs to catch dynamics explosion.
+
+    Uses the production timestep (dt=0.003) and checks that energy stays
+    finite throughout.  These tests catch regressions where forces / torques
+    are incorrect and would cause rapid divergence.
+    """
+
+    # ------------------------------------------------------------------ DNA
+
+    def test_dna_langevin_500_steps_finite(self, hairpin_model):
+        """500 stochastic Langevin steps at dt=0.003 — energy must stay finite.
+
+        The energy is checked every 50 steps.  A genuine explosion (e.g. due
+        to a wrong force sign) will produce NaN / Inf within ~10 steps.
+        """
+        model, topology, state = hairpin_model
+        integrator = LangevinIntegrator(model, dt=0.003, gamma=1.0,
+                                        temperature=T_334K)
+        torch.manual_seed(0)
+        s = SystemState(
+            positions=state.positions.clone().detach(),
+            quaternions=state.quaternions.clone().detach(),
+            box=state.box,
+        )
+        for step in range(500):
+            s = integrator.step(s, stochastic=True)
+            if (step + 1) % 50 == 0:
+                e = model(s).item()
+                assert math.isfinite(e), \
+                    f"DNA energy not finite at step {step + 1}: {e}"
+                # Very loose upper bound — any real explosion exceeds this
+                assert abs(e) < 1e4, \
+                    f"DNA energy exploded at step {step + 1}: {e}"
+
+    def test_dna_quaternions_stay_normalized_500_steps(self, hairpin_model):
+        """Quaternions must remain unit-length over 500 Langevin steps."""
+        model, topology, state = hairpin_model
+        integrator = LangevinIntegrator(model, dt=0.003, gamma=1.0,
+                                        temperature=T_334K)
+        torch.manual_seed(1)
+        s = SystemState(
+            positions=state.positions.clone().detach(),
+            quaternions=state.quaternions.clone().detach(),
+            box=state.box,
+        )
+        for _ in range(500):
+            s = integrator.step(s, stochastic=True)
+
+        norms = torch.norm(s.quaternions, dim=-1)
+        assert torch.allclose(norms, torch.ones_like(norms), atol=1e-9), \
+            f"Quaternion norms drifted: min={norms.min():.8f} max={norms.max():.8f}"
+
+    def test_dna_nve_energy_conservation(self, hairpin_model):
+        """NVE (VelocityVerlet) should conserve total energy to O(dt^2).
+
+        At dt=0.001, total-energy drift over 200 steps should be < 0.01
+        reduced-energy units — a factor ~100 above floating-point noise
+        but well below any dynamics explosion.
+        """
+        model, topology, state = hairpin_model
+        torch.manual_seed(2)
+        T = T_334K
+        vel = torch.randn(topology.n_nucleotides, 3,
+                          dtype=state.positions.dtype) * math.sqrt(T)
+        s = SystemState(
+            positions=state.positions.clone().detach(),
+            quaternions=state.quaternions.clone().detach(),
+            velocities=vel,
+            box=state.box,
+        )
+
+        integrator = VelocityVerletIntegrator(model, dt=0.001)
+
+        e0 = model(s).item()
+        ke0 = 0.5 * (vel ** 2).sum().item()
+        etot0 = e0 + ke0
+
+        for _ in range(200):
+            s = integrator.step(s)
+
+        e_final = model(s).item()
+        ke_final = 0.5 * (s.velocities ** 2).sum().item()
+        etot_final = e_final + ke_final
+
+        drift = abs(etot_final - etot0)
+        assert math.isfinite(etot_final), \
+            f"NVE total energy is not finite: {etot_final}"
+        assert drift < 0.01, \
+            f"NVE energy drift too large: {drift:.6f} (E0={etot0:.4f}, Ef={etot_final:.4f})"
+
+    # ------------------------------------------------------------------ RNA
+
+    @pytest.mark.skipif(not _rna_files_exist, reason="examples/RNA_MD files not found")
+    def test_rna_langevin_500_steps_finite(self):
+        """500 stochastic Langevin steps on the 132-nt RNA at dt=0.003.
+
+        Energy is sampled every 50 steps; must remain finite and within a
+        loose physical range (< 0 and > −10 * N_nucleotides).
+        """
+        from oxdna_torch import load_rna_system, OxRNAEnergy
+
+        topology, state = load_rna_system(_RNA_TOP, _RNA_CONF)
+        T_red = (273.15 + 25) / 3000.0
+        model = OxRNAEnergy(topology, temperature=T_red, seq_dependent=True)
+        integrator = LangevinIntegrator(model, dt=0.003, gamma=1.0,
+                                        temperature=T_red)
+        torch.manual_seed(3)
+        s = state
+        for step in range(500):
+            s = integrator.step(s, stochastic=True)
+            if (step + 1) % 50 == 0:
+                e = model(s).item()
+                assert math.isfinite(e), \
+                    f"RNA energy not finite at step {step + 1}: {e}"
+                assert abs(e) < 1e5, \
+                    f"RNA energy exploded at step {step + 1}: {e}"
+
+    @pytest.mark.skipif(not _rna_files_exist, reason="examples/RNA_MD files not found")
+    def test_rna_quaternions_stay_normalized_500_steps(self):
+        """Quaternions must remain unit-length over 500 RNA Langevin steps."""
+        from oxdna_torch import load_rna_system, OxRNAEnergy
+
+        topology, state = load_rna_system(_RNA_TOP, _RNA_CONF)
+        T_red = (273.15 + 25) / 3000.0
+        model = OxRNAEnergy(topology, temperature=T_red, seq_dependent=True)
+        integrator = LangevinIntegrator(model, dt=0.003, gamma=1.0,
+                                        temperature=T_red)
+        torch.manual_seed(4)
+        s = state
+        for _ in range(500):
+            s = integrator.step(s, stochastic=True)
+
+        norms = torch.norm(s.quaternions, dim=-1)
+        assert torch.allclose(norms, torch.ones_like(norms), atol=1e-9), \
+            f"RNA quaternion norms drifted: min={norms.min():.8f} max={norms.max():.8f}"
+
+    @pytest.mark.skipif(not _rna_files_exist, reason="examples/RNA_MD files not found")
+    def test_rna_energy_per_nt_in_physical_range(self):
+        """After 200 equilibration steps the RNA energy/nt should be in [-3, -0.5].
+
+        This catches sign errors or grossly wrong potential parameters that
+        would shift the energy far outside the physically expected window
+        (reference C++ oxRNA2 gives ≈ −1.34 per nucleotide at 25 °C).
+        """
+        from oxdna_torch import load_rna_system, OxRNAEnergy
+
+        topology, state = load_rna_system(_RNA_TOP, _RNA_CONF)
+        T_red = (273.15 + 25) / 3000.0
+        model = OxRNAEnergy(topology, temperature=T_red, seq_dependent=True)
+        integrator = LangevinIntegrator(model, dt=0.003, gamma=1.0,
+                                        temperature=T_red)
+        torch.manual_seed(5)
+        s = state
+        for _ in range(200):
+            s = integrator.step(s, stochastic=True)
+
+        e_per_nt = model(s).item() / topology.n_nucleotides
+        assert math.isfinite(e_per_nt), f"E/nt not finite: {e_per_nt}"
+        assert -3.0 < e_per_nt < -0.5, \
+            f"RNA E/nt={e_per_nt:.4f} outside physical range (-3, -0.5)"

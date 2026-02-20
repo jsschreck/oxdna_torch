@@ -45,11 +45,15 @@ class OxRNAEnergy(nn.Module):
     """Full oxRNA1 potential energy as a differentiable nn.Module.
 
     Args:
-        topology:       RNATopology object (connectivity + base types)
-        temperature:    simulation temperature in oxDNA reduced units
-                        (T_reduced = T_kelvin / 3000)
-        seq_dependent:  if True, use sequence-dependent stacking/HB/cross-stacking
-                        parameters; if False use average-sequence values
+        topology:                    RNATopology object (connectivity + base types)
+        temperature:                 simulation temperature in oxDNA reduced units
+                                     (T_reduced = T_kelvin / 3000)
+        seq_dependent:               if True, use sequence-dependent stacking/HB/
+                                     cross-stacking parameters
+        mismatch_repulsion:          if True, add a repulsive bump for non-Watson-
+                                     Crick pairs (matches oxRNA2 mismatch_repulsion)
+        mismatch_repulsion_strength: strength of the mismatch repulsion (default 1.0);
+                                     corresponds to C++ mismatch_repulsion_strength
     """
 
     def __init__(
@@ -57,12 +61,16 @@ class OxRNAEnergy(nn.Module):
         topology: RNATopology,
         temperature: float,
         seq_dependent: bool = True,
+        mismatch_repulsion: bool = False,
+        mismatch_repulsion_strength: float = 1.0,
     ):
         super().__init__()
 
         self.topology    = topology
         self.temperature = temperature
         self.seq_dependent = seq_dependent
+        self.mismatch_repulsion = mismatch_repulsion
+        self.mismatch_repulsion_strength = mismatch_repulsion_strength
 
         # Interaction cutoff
         self.cutoff: float = RC.compute_rna_rcut()
@@ -187,7 +195,9 @@ class OxRNAEnergy(nn.Module):
 
         e_hbond = rna_hbond_energy(
             positions, quaternions, nbp,
-            self.base_types, self.hbond_eps_table, box)
+            self.base_types, self.hbond_eps_table, box,
+            mismatch_repulsion=self.mismatch_repulsion,
+            mismatch_repulsion_strength=self.mismatch_repulsion_strength)
 
         e_cross = rna_cross_stacking_energy(
             positions, quaternions, nbp,
@@ -228,7 +238,23 @@ class OxRNAEnergy(nn.Module):
             'hbond':          rna_hbond_energy(
                                   positions, quaternions, nbp,
                                   self.base_types,
-                                  self.hbond_eps_table, box).item(),
+                                  self.hbond_eps_table, box,
+                                  mismatch_repulsion=False).item(),
+            'mismatch_repulsion': (
+                                  rna_hbond_energy(
+                                      positions, quaternions, nbp,
+                                      self.base_types,
+                                      self.hbond_eps_table, box,
+                                      mismatch_repulsion=True,
+                                      mismatch_repulsion_strength=self.mismatch_repulsion_strength,
+                                  ).item()
+                                  - rna_hbond_energy(
+                                      positions, quaternions, nbp,
+                                      self.base_types,
+                                      self.hbond_eps_table, box,
+                                      mismatch_repulsion=False,
+                                  ).item()
+                                  ) if self.mismatch_repulsion else 0.0,
             'cross_stacking': rna_cross_stacking_energy(
                                   positions, quaternions, nbp,
                                   self.base_types,

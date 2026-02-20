@@ -130,22 +130,27 @@ class LangevinIntegrator(nn.Module):
         state: SystemState,
         create_graph: bool = False,
     ) -> Tuple[Tensor, Tensor]:
-        """Compute forces (N,3) and lab-frame torques (N,3) via autograd."""
-        pos_grad = state.positions.detach().requires_grad_(True)
-        quat_grad = state.quaternions.detach().requires_grad_(True)
+        """Compute forces (N,3) and lab-frame torques (N,3) via autograd.
 
-        state_grad = SystemState(
-            positions=pos_grad,
-            quaternions=quat_grad,
-            box=state.box,
-        )
+        Always runs with grad enabled internally (using enable_grad) so it
+        works correctly even when called from inside a torch.no_grad() block.
+        """
+        with torch.enable_grad():
+            pos_grad = state.positions.detach().requires_grad_(True)
+            quat_grad = state.quaternions.detach().requires_grad_(True)
 
-        energy = self.energy_model(state_grad)
+            state_grad = SystemState(
+                positions=pos_grad,
+                quaternions=quat_grad,
+                box=state.box,
+            )
 
-        grads = torch.autograd.grad(
-            energy, [pos_grad, quat_grad],
-            create_graph=create_graph,
-        )
+            energy = self.energy_model(state_grad)
+
+            grads = torch.autograd.grad(
+                energy, [pos_grad, quat_grad],
+                create_graph=create_graph,
+            )
 
         forces = -grads[0]   # (N, 3)  F = -dE/dpos
         dEdq = grads[1]      # (N, 4)  dE/dq (positive sign)
@@ -279,8 +284,15 @@ class LangevinIntegrator(nn.Module):
             stochastic: whether to add Langevin noise
             checkpoint_every: if > 0, use gradient checkpointing every N steps
                 (saves memory at cost of recomputation during backward pass)
-            save_every: save state every N steps (1 = save all)
-            create_graph: build autograd graph for backprop through time
+            save_every: save state every N steps (1 = save all).
+                When save_every > 1 and create_graph=True, the intermediate
+                (non-saved) steps are run under torch.no_grad() for efficiency
+                — only the saved steps carry the autograd graph.  This gives
+                decorrelated samples at a fraction of the memory cost of
+                tracking every step.
+            create_graph: build autograd graph for backprop through time.
+                Only the saved states (every save_every steps) will have
+                gradients; intermediate burn-in steps are detached.
 
         Returns:
             List of SystemState snapshots along the trajectory
@@ -317,11 +329,38 @@ class LangevinIntegrator(nn.Module):
             current_state = state
             cached_forces = None  # carry forces from step N → step N+1
             for i in range(n_steps):
-                current_state, cached_forces = self._step_with_forces(
-                    current_state, stochastic=stochastic,
-                    create_graph=create_graph, _forces=cached_forces,
-                )
-                if (i + 1) % save_every == 0:
+                is_save_step = (i + 1) % save_every == 0 or (i + 1) == n_steps
+
+                # Optimisation: when save_every > 1 and create_graph=True,
+                # run burn-in steps as pure inference (no graph) and only
+                # build the autograd graph on the saved step.  This avoids
+                # storing the full computational graph for every intermediate
+                # step.  When save_every == 1 we stay on the graph throughout
+                # (classic BPTT behaviour, unchanged).
+                if create_graph and save_every > 1:
+                    if is_save_step:
+                        # Detach so gradients don't flow through the
+                        # no_grad burn-in steps above.
+                        current_state = current_state.detach()
+                        cached_forces = None   # invalidate after detach
+                        current_state, cached_forces = self._step_with_forces(
+                            current_state, stochastic=stochastic,
+                            create_graph=True, _forces=cached_forces,
+                        )
+                    else:
+                        with torch.no_grad():
+                            current_state, cached_forces = self._step_with_forces(
+                                current_state, stochastic=stochastic,
+                                create_graph=False, _forces=cached_forces,
+                            )
+                else:
+                    # Default path: no special optimisation
+                    current_state, cached_forces = self._step_with_forces(
+                        current_state, stochastic=stochastic,
+                        create_graph=create_graph, _forces=cached_forces,
+                    )
+
+                if is_save_step:
                     trajectory.append(current_state)
 
         return trajectory

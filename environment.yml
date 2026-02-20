@@ -11,3 +11,6 @@ dependencies:
   - pip:
     - oxDNA-analysis-tools
     - -e .
+    # Optional: TorchMD-Net neighbour-list backend (faster GPU NL kernel)
+    # Uncomment to install:
+    # - torchmd-net
