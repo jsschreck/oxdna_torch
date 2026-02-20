@@ -240,7 +240,6 @@ loss.backward()   # gradients flow through each saved step only
 ```
 
 With `save_every=1` (default) the classic full-graph BPTT behaviour is preserved — every step carries the autograd graph.
-<<<<<<< HEAD
 
 ### File Output (trajectory, lastconf, energy)
 
@@ -281,8 +280,6 @@ trajectory = integrator.rollout(
     start_step=10_000_000,
 )
 ```
-=======
->>>>>>> 34093b8680a2e30ace82e6daf2b8b76c11df30f6
 
 ## Learnable Parameters
 

@@ -294,7 +294,6 @@ class LangevinIntegrator(nn.Module):
             stochastic: whether to add Langevin noise
             checkpoint_every: if > 0, use gradient checkpointing every N steps
                 (saves memory at cost of recomputation during backward pass)
-<<<<<<< HEAD
             save_every: save state to the *in-memory* trajectory list every N
                 steps (1 = save all).  When save_every > 1 and
                 create_graph=True the intermediate (non-saved) steps run under
@@ -321,17 +320,6 @@ class LangevinIntegrator(nn.Module):
                 0 means never write.
             start_step: step counter offset written to conf headers and energy
                 files (useful when resuming a run).
-=======
-            save_every: save state every N steps (1 = save all).
-                When save_every > 1 and create_graph=True, the intermediate
-                (non-saved) steps are run under torch.no_grad() for efficiency
-                — only the saved steps carry the autograd graph.  This gives
-                decorrelated samples at a fraction of the memory cost of
-                tracking every step.
-            create_graph: build autograd graph for backprop through time.
-                Only the saved states (every save_every steps) will have
-                gradients; intermediate burn-in steps are detached.
->>>>>>> 34093b8680a2e30ace82e6daf2b8b76c11df30f6
 
         Returns:
             List of SystemState snapshots along the in-memory trajectory
@@ -396,10 +384,7 @@ class LangevinIntegrator(nn.Module):
             current_state = state
             cached_forces = None  # carry forces from step N → step N+1
             for i in range(n_steps):
-<<<<<<< HEAD
                 step = start_step + i + 1          # 1-indexed absolute step
-=======
->>>>>>> 34093b8680a2e30ace82e6daf2b8b76c11df30f6
                 is_save_step = (i + 1) % save_every == 0 or (i + 1) == n_steps
 
                 # Optimisation: when save_every > 1 and create_graph=True,

@@ -4,6 +4,7 @@ Tests for the integrator module (dynamics and backprop through time).
 
 import math
 import os
+import tempfile
 
 import torch
 import pytest
@@ -275,6 +276,224 @@ class TestRollout:
 
         # initial + steps 5 and 10
         assert len(trajectory) == 3
+
+
+class TestFileOutput:
+    """Tests for trajectory_file / lastconf_file / energy_file output."""
+
+    def test_lastconf_written(self, hairpin_model):
+        """lastconf_file should be created and readable after rollout."""
+        from oxdna_torch.io import read_configuration
+
+        model, topology, state = hairpin_model
+        integrator = LangevinIntegrator(model, dt=0.003, gamma=1.0, temperature=T_334K)
+        s = SystemState(
+            positions=state.positions.clone().detach(),
+            quaternions=state.quaternions.clone().detach(),
+            box=state.box,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            last = os.path.join(tmp, "last.dat")
+            integrator.rollout(s, n_steps=10, lastconf_file=last)
+
+            assert os.path.isfile(last), "lastconf_file was not created"
+            reloaded = read_configuration(last)
+            assert reloaded.positions.shape == s.positions.shape
+            assert not torch.isnan(reloaded.positions).any()
+
+    def test_lastconf_timestep_header(self, hairpin_model):
+        """lastconf_file header should carry the correct final timestep."""
+        model, topology, state = hairpin_model
+        integrator = LangevinIntegrator(model, dt=0.003, gamma=1.0, temperature=T_334K)
+        s = SystemState(
+            positions=state.positions.clone().detach(),
+            quaternions=state.quaternions.clone().detach(),
+            box=state.box,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            last = os.path.join(tmp, "last.dat")
+            integrator.rollout(s, n_steps=20, lastconf_file=last, start_step=1000)
+
+            first_line = open(last).readline().strip()
+            # should be "t = 1020"
+            assert first_line == "t = 1020", \
+                f"Expected 't = 1020', got '{first_line}'"
+
+    def test_lastconf_energy_header_nonzero(self, hairpin_model):
+        """lastconf_file E= line should contain real (non-zero) energies."""
+        model, topology, state = hairpin_model
+        integrator = LangevinIntegrator(model, dt=0.003, gamma=1.0, temperature=T_334K)
+        s = SystemState(
+            positions=state.positions.clone().detach(),
+            quaternions=state.quaternions.clone().detach(),
+            box=state.box,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            last = os.path.join(tmp, "last.dat")
+            integrator.rollout(s, n_steps=5, lastconf_file=last)
+
+            lines = open(last).readlines()
+            e_line = lines[2].strip()   # "E = Epot Ekin Etot"
+            parts = e_line.split()
+            epot = float(parts[2])
+            assert epot != 0.0, "Epot in lastconf header should be non-zero"
+            assert math.isfinite(epot), f"Epot in lastconf header is not finite: {epot}"
+
+    def test_trajectory_file_frame_count(self, hairpin_model):
+        """trajectory_file should contain exactly n_steps/interval frames."""
+        model, topology, state = hairpin_model
+        integrator = LangevinIntegrator(model, dt=0.003, gamma=1.0, temperature=T_334K)
+        s = SystemState(
+            positions=state.positions.clone().detach(),
+            quaternions=state.quaternions.clone().detach(),
+            box=state.box,
+        )
+        n_steps = 20
+        interval = 5
+        expected_frames = n_steps // interval   # 4
+
+        with tempfile.TemporaryDirectory() as tmp:
+            traj = os.path.join(tmp, "traj.dat")
+            integrator.rollout(s, n_steps=n_steps,
+                               trajectory_file=traj,
+                               print_conf_interval=interval)
+
+            lines = open(traj).readlines()
+            lines_per_frame = 3 + topology.n_nucleotides
+            assert len(lines) == expected_frames * lines_per_frame, \
+                f"Expected {expected_frames} frames ({expected_frames*lines_per_frame} lines), " \
+                f"got {len(lines)} lines"
+
+    def test_trajectory_file_timesteps(self, hairpin_model):
+        """Timestep headers in trajectory should be monotonically increasing."""
+        model, topology, state = hairpin_model
+        integrator = LangevinIntegrator(model, dt=0.003, gamma=1.0, temperature=T_334K)
+        s = SystemState(
+            positions=state.positions.clone().detach(),
+            quaternions=state.quaternions.clone().detach(),
+            box=state.box,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            traj = os.path.join(tmp, "traj.dat")
+            integrator.rollout(s, n_steps=20,
+                               trajectory_file=traj,
+                               print_conf_interval=5)
+
+            lines = open(traj).readlines()
+            lines_per_frame = 3 + topology.n_nucleotides
+            timesteps = [
+                int(lines[i * lines_per_frame].split()[2])
+                for i in range(4)
+            ]
+            assert timesteps == [5, 10, 15, 20], \
+                f"Unexpected timesteps: {timesteps}"
+
+    def test_trajectory_truncated_on_new_run(self, hairpin_model):
+        """A second rollout should overwrite (not append to) trajectory_file."""
+        model, topology, state = hairpin_model
+        integrator = LangevinIntegrator(model, dt=0.003, gamma=1.0, temperature=T_334K)
+        s = SystemState(
+            positions=state.positions.clone().detach(),
+            quaternions=state.quaternions.clone().detach(),
+            box=state.box,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            traj = os.path.join(tmp, "traj.dat")
+            # First run: 10 steps, interval 5 → 2 frames
+            integrator.rollout(s, n_steps=10,
+                               trajectory_file=traj,
+                               print_conf_interval=5)
+            lines_first = len(open(traj).readlines())
+
+            # Second run: same — should truncate and write fresh
+            integrator.rollout(s, n_steps=10,
+                               trajectory_file=traj,
+                               print_conf_interval=5)
+            lines_second = len(open(traj).readlines())
+
+            assert lines_second == lines_first, \
+                "Second run should truncate trajectory_file, not append"
+
+    def test_energy_file_record_count(self, hairpin_model):
+        """energy_file should have a header plus one record per interval."""
+        model, topology, state = hairpin_model
+        integrator = LangevinIntegrator(model, dt=0.003, gamma=1.0, temperature=T_334K)
+        s = SystemState(
+            positions=state.positions.clone().detach(),
+            quaternions=state.quaternions.clone().detach(),
+            box=state.box,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            efile = os.path.join(tmp, "energy.dat")
+            integrator.rollout(s, n_steps=20,
+                               energy_file=efile,
+                               print_energy_every=4)
+
+            lines = [l for l in open(efile).readlines() if l.strip()]
+            # 1 header + 5 records (steps 4,8,12,16,20)
+            assert len(lines) == 6, \
+                f"Expected 6 lines (1 header + 5 records), got {len(lines)}"
+
+    def test_energy_file_values_finite(self, hairpin_model):
+        """All energy records should be finite numbers."""
+        model, topology, state = hairpin_model
+        integrator = LangevinIntegrator(model, dt=0.003, gamma=1.0, temperature=T_334K)
+        s = SystemState(
+            positions=state.positions.clone().detach(),
+            quaternions=state.quaternions.clone().detach(),
+            box=state.box,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            efile = os.path.join(tmp, "energy.dat")
+            integrator.rollout(s, n_steps=10,
+                               energy_file=efile,
+                               print_energy_every=2)
+
+            for line in open(efile).readlines():
+                if line.startswith("#"):
+                    continue
+                step, epot, ekin, etot = line.split()
+                assert math.isfinite(float(epot)), f"Epot not finite: {epot}"
+                assert math.isfinite(float(ekin)), f"Ekin not finite: {ekin}"
+                assert math.isfinite(float(etot)), f"Etot not finite: {etot}"
+                # Etot should equal Epot + Ekin (within rounding of 6 d.p. format)
+                assert abs(float(etot) - (float(epot) + float(ekin))) < 1e-5
+
+    def test_energy_file_step_counter_with_start_step(self, hairpin_model):
+        """step column should be offset by start_step."""
+        model, topology, state = hairpin_model
+        integrator = LangevinIntegrator(model, dt=0.003, gamma=1.0, temperature=T_334K)
+        s = SystemState(
+            positions=state.positions.clone().detach(),
+            quaternions=state.quaternions.clone().detach(),
+            box=state.box,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            efile = os.path.join(tmp, "energy.dat")
+            integrator.rollout(s, n_steps=10,
+                               energy_file=efile,
+                               print_energy_every=5,
+                               start_step=500)
+
+            records = [l for l in open(efile).readlines() if not l.startswith("#")]
+            steps = [int(r.split()[0]) for r in records]
+            assert steps == [505, 510], \
+                f"Expected steps [505, 510], got {steps}"
+
+    def test_no_files_by_default(self, hairpin_model):
+        """rollout() without file args should not create any files."""
+        model, topology, state = hairpin_model
+        integrator = LangevinIntegrator(model, dt=0.003, gamma=1.0, temperature=T_334K)
+        s = SystemState(
+            positions=state.positions.clone().detach(),
+            quaternions=state.quaternions.clone().detach(),
+            box=state.box,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            integrator.rollout(s, n_steps=5)
+            created = os.listdir(tmp)
+            assert created == [], \
+                f"Unexpected files created with no file args: {created}"
 
 
 class TestStability:
