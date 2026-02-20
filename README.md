@@ -1,21 +1,31 @@
 # oxdna_torch
 
-`oxdna_torch` is a high-performance, fully differentiable PyTorch reimplementation of the **oxDNA coarse-grained model**.
+A fully differentiable PyTorch reimplementation of the **oxDNA** and **oxRNA** coarse-grained nucleic acid models. Forces and torques are obtained via automatic differentiation, so gradients flow through the physics — enabling backpropagation through molecular dynamics trajectories and gradient-based parameter optimisation.
 
-By leveraging PyTorch's autograd engine, this package allows for the calculation of forces and torques via automatic differentiation, enabling backpropagation through physics-based trajectories. This makes it a powerful tool for:
+## Models
 
-* **Machine Learning Integration**: Combining physical potentials with neural networks.
-* **Parameter Optimization**: Learning or refining oxDNA interaction parameters directly from experimental or simulation data.
-* **Inverse Design**: Performing sequence design by backpropagating through structural properties.
+| Model | Class | Interaction terms |
+|-------|-------|-------------------|
+| **oxDNA1** | `OxDNAEnergy` | FENE, excl. vol., stacking, H-bond, cross-stacking, coaxial stacking |
+| **oxDNA2** | `OxDNAEnergy(use_oxdna2=True)` | All oxDNA1 terms + Debye–Hückel electrostatics + major/minor-groove geometry |
+| **oxRNA1** | `OxRNAEnergy` | RNA-specific FENE, excl. vol., stacking (asymmetric STACK_3/STACK_5 sites), H-bond, cross-stacking, coaxial stacking |
+
+All three models support:
+- **Sequence-averaged** or **sequence-dependent** stacking / H-bond parameters
+- **Periodic boundary conditions** with minimum-image convention
+- **GPU acceleration** — move the model and state with `.to('cuda')`
+- **Autograd forces and torques** through every interaction term
+- **Learnable parameters** — promote any physical constant to `nn.Parameter`
 
 ## Features
 
-* **Complete oxDNA1 Potential**: Includes all 7 interaction terms: FENE, Stacking, Hydrogen Bonding, Cross Stacking, Coaxial Stacking, and Excluded Volume (Bonded and Non-bonded).
-* **Fully Differentiable**: Every potential term is implemented using pure PyTorch operations, ensuring gradients are preserved throughout the simulation.
-* **GPU Acceleration**: Native support for CUDA, allowing for massive parallelization of energy and force calculations.
-* **Differentiable Integrators**: Includes Langevin and Velocity-Verlet integrators that support backpropagation through time (BPTT).
-* **Memory Efficiency**: Optional gradient checkpointing for long trajectories to trade computation for reduced memory usage.
-* **Parameter Store**: A centralized registry to manage learnable parameters versus frozen constants.
+- **Complete potentials** — every interaction term from the published oxDNA1, oxDNA2, and oxRNA1 models, validated against the reference C++ implementation
+- **Inertial Langevin integrator** — velocity-Verlet + Langevin thermostat matching the `MD_CPUBackend` in reference oxDNA C++, with correct torque derivation from quaternion gradients
+- **Backprop through time** — `create_graph=True` keeps the autograd graph across integration steps; optional gradient checkpointing trades compute for memory on long trajectories
+- **Neighbour-list caching** — `set_nl_skin(skin)` reuses the pair list across steps until any particle drifts more than `skin/2`, reducing NL rebuilds during dynamics
+- **TorchMD-Net NL backend** — drop-in replacement neighbour kernel (`set_nl_backend('torchmdnet')`) that dispatches to a Triton-fused GPU kernel when CUDA is available, or pure-PyTorch on CPU
+- **`torch.compile` support** — call `model.compile()` to apply `torch.compile` to the energy model for faster rollouts
+- **Standard file I/O** — reads and writes oxDNA `.top` / `.conf` files directly, including native RNA topology files with integer base-type codes
 
 ## Installation
 
@@ -23,60 +33,228 @@ By leveraging PyTorch's autograd engine, this package allows for the calculation
 git clone https://github.com/jsschreck/oxdna_torch.git
 cd oxdna_torch
 pip install -e .
-
 ```
 
-## Quick Start
+Requires Python ≥ 3.9 and PyTorch ≥ 2.0.
 
-The following example demonstrates how to load a system, compute energies and forces, and run a short trajectory on a GPU.
+**Optional — TorchMD-Net neighbour kernel:**
+```bash
+pip install torchmd-net
+```
+
+## Quick Start — DNA
 
 ```python
 import torch
 from oxdna_torch import load_system, OxDNAEnergy
 from oxdna_torch.integrator import LangevinIntegrator
 
-# 1. Load system topology and configuration
-# You can load directly to a specific device (e.g., 'cuda' or 'cpu')
-topology, state = load_system("topology.top", "config.conf", device='cuda')
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# 2. Initialize the Energy Model
-# Temperature is provided in oxDNA reduced units (T_kelvin / 3000)
+# Load topology and initial configuration
+topology, state = load_system("examples/HAIRPIN/initial.top",
+                              "examples/HAIRPIN/initial.conf",
+                              device=device)
+
+# Build the energy model (oxDNA1, sequence-dependent)
+# Temperature in oxDNA reduced units: T_reduced = T_kelvin / 3000
 model = OxDNAEnergy(
-    topology, 
-    temperature=0.1113, # ~334K
-    seq_dependent=True
-).to('cuda')
+    topology,
+    temperature=0.1113,   # ≈ 334 K
+    seq_dependent=True,
+).to(device)
 
-# 3. Compute Energy and Forces
-# Positions and quaternions in 'state' can track gradients
+# Evaluate energy and per-term breakdown
 energy = model(state)
-forces = model.compute_forces(state)
+components = model.energy_components(state)
+for name, val in components.items():
+    print(f"  {name:25s}: {val.item():+.4f}")
 
-print(f"Total Potential Energy: {energy.item()}")
+# Compute forces via autograd
+forces = model.compute_forces(state)   # (N, 3)
 
-# 4. Run Dynamics
-integrator = LangevinIntegrator(
-    model, 
-    dt=0.003, 
-    gamma=1.0, 
-    temperature=0.1113
+# Run Langevin dynamics
+integrator = LangevinIntegrator(model, dt=0.003, gamma=1.0, temperature=0.1113)
+trajectory = integrator.rollout(state, n_steps=1000)
+```
+
+## Quick Start — oxDNA2
+
+```python
+from oxdna_torch import load_system, OxDNAEnergy
+
+topology, state = load_system("topology.top", "conf.dat")
+
+model = OxDNAEnergy(
+    topology,
+    temperature=0.1,
+    seq_dependent=True,
+    use_oxdna2=True,            # enables Debye–Hückel + major/minor groove
+    salt_concentration=0.5,     # molar salt for DH screening length
+    dh_half_charged_ends=True,  # reduced charge at strand termini
+)
+```
+
+## Quick Start — oxRNA
+
+```python
+import torch
+from oxdna_torch import load_rna_system, OxRNAEnergy
+from oxdna_torch.integrator import LangevinIntegrator
+
+# Load an RNA system (supports letter codes A/C/G/U and native integer btype codes)
+topology, state = load_rna_system("examples/RNA_MD/prova.top",
+                                  "examples/RNA_MD/prova.dat")
+
+# T = 25 °C in oxDNA reduced units (T_kelvin / 3000)
+T_red = (273.15 + 25) / 3000.0
+
+model = OxRNAEnergy(
+    topology,
+    temperature=T_red,
+    seq_dependent=True,   # use published RNA sequence-dependent parameters
 )
 
-# Perform a 100-step simulation
-trajectory = integrator.rollout(state, n_steps=100)
+# Per-term energy breakdown
+components = model.energy_components(state)
+for name, val in components.items():
+    print(f"  {name:20s}: {val.item():+.4f}")
 
+# Forces via autograd
+pos = state.positions.detach().requires_grad_(True)
+s = state.__class__(positions=pos, quaternions=state.quaternions.detach(),
+                    box=state.box)
+model(s).backward()
+forces = -pos.grad   # (N, 3)
+
+# Langevin MD
+integrator = LangevinIntegrator(model, dt=0.003, gamma=1.0, temperature=T_red)
+trajectory = integrator.rollout(state, n_steps=500)
 ```
+
+The `examples/RNA_MD/` directory contains a 132-nucleotide single-stranded RNA snapshot (`prova.top` / `prova.dat`) generated with oxRNA2 MD at 25 °C, suitable for validation.
+
+## Neighbour-List Backends
+
+Two backends are available for building the non-bonded pair list:
+
+| Backend | Select | Notes |
+|---------|--------|-------|
+| **`'oxdna'`** (default) | `model.set_nl_backend('oxdna')` | Built-in brute-force / cell-list; no extra dependencies |
+| **`'torchmdnet'`** | `model.set_nl_backend('torchmdnet')` | TorchMD-Net kernel; Triton-fused on CUDA, pure-PyTorch on CPU. Requires `pip install torchmd-net` |
+
+```python
+model.set_nl_backend('torchmdnet')   # opt in to faster GPU kernel
+model.set_nl_backend('oxdna')        # revert to default
+```
+
+### Neighbour-List Caching
+
+Enable NL caching to avoid rebuilding the pair list every step:
+
+```python
+model.set_nl_skin(0.05)   # reuse NL until any particle drifts > 0.025 reduced units
+```
+
+The pair list is rebuilt automatically when needed. Set `skin=0.0` (default) to rebuild every step.
+
+## `torch.compile`
+
+```python
+model.compile()   # wraps the energy model with torch.compile
+```
+
+## Integrator
+
+`LangevinIntegrator` implements inertial Langevin dynamics (velocity-Verlet + Langevin thermostat) matching the `MD_CPUBackend` algorithm in reference oxDNA:
+
+1. Half-kick velocities and angular momenta from forces / torques
+2. Thermostat noise kick (first half)
+3. Drift positions; update orientations from angular velocity via Rodrigues rotation
+4. Recompute forces / torques at new positions
+5. Second half-kick and thermostat noise kick
+
+Torques are derived from the quaternion gradient `dE/dq` using the rotation generator `dq/dθᵢ = 0.5 · [0, eᵢ] ⊗ q`. Rotational diffusion uses `D_rot = 3 · D_trans` per the oxDNA convention.
+
+Key parameters:
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `dt` | Timestep (reduced units) | `0.003` |
+| `gamma` | Translational friction | `1.0` |
+| `temperature` | Temperature (`T_kelvin / 3000`) | `0.1` |
+| `mass` | Particle mass | `1.0` |
+| `inertia` | Moment of inertia | `1.0` |
+
+For backprop through time, pass `create_graph=True` to `step()` or `rollout()`. For memory-efficient BPTT on long trajectories, use `checkpoint_every=N` in `rollout()`.
+
+## Learnable Parameters
+
+Any physical constant in the potential can be made a gradient-tracked `nn.Parameter`:
+
+```python
+model = OxDNAEnergy(
+    topology,
+    temperature=0.1113,
+    learnable={'stacking_eps', 'hbond_eps', 'fene_eps'},
+)
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+```
+
+Available learnable parameter names are listed in `oxdna_torch/params.py` (`PARAM_REGISTRY`). The special names `stacking_eps` and `hbond_eps` make the per-pair / per-type epsilon matrices learnable.
 
 ## Repository Structure
 
-* `oxdna_torch/model.py`: The top-level `OxDNAEnergy` module that assembles all interaction terms.
-* `oxdna_torch/interactions/`: Individual modules for each of the 7 oxDNA potential terms.
-* `oxdna_torch/integrator.py`: Differentiable Langevin and Velocity-Verlet dynamics.
-* `oxdna_torch/params.py`: Management of learnable vs. fixed physical parameters.
-* `oxdna_torch/io.py`: Support for standard oxDNA `.top` and `.conf` file formats.
-* `oxdna_torch/quaternion.py`: Quaternion utilities for rigid body rotations of nucleotides.
+```
+oxdna_torch/
+├── model.py             # OxDNAEnergy — oxDNA1 and oxDNA2
+├── rna_model.py         # OxRNAEnergy — oxRNA1
+├── integrator.py        # LangevinIntegrator, VelocityVerletIntegrator
+├── state.py             # SystemState dataclass (positions, quaternions, box, …)
+├── topology.py          # Topology: DNA connectivity, base types, bonded pairs
+├── rna_topology.py      # RNATopology: RNA connectivity and sequence-dep. tables
+├── io.py                # load_system, read/write_configuration (.top / .conf)
+├── rna_io.py            # load_rna_system; handles letter and integer btype codes
+├── quaternion.py        # Quaternion arithmetic and rotation utilities
+├── pairs.py             # Neighbour finding ('oxdna' and 'torchmdnet' backends)
+├── params.py            # ParameterStore for learnable vs. frozen constants
+├── constants.py         # All oxDNA1/2 numerical constants
+├── rna_constants.py     # All oxRNA1 numerical constants
+└── interactions/
+    ├── fene.py                  # DNA FENE backbone
+    ├── excluded_volume.py       # DNA excluded volume
+    ├── stacking.py              # DNA stacking
+    ├── hbond.py                 # DNA hydrogen bonding
+    ├── cross_stacking.py        # DNA cross-stacking
+    ├── coaxial_stacking.py      # DNA coaxial stacking
+    ├── electrostatics.py        # Debye–Hückel (oxDNA2)
+    ├── rna_fene.py              # RNA FENE backbone
+    ├── rna_excl_vol.py          # RNA excluded volume
+    ├── rna_stacking.py          # RNA stacking (asymmetric STACK_3/STACK_5)
+    ├── rna_hbond.py             # RNA hydrogen bonding
+    ├── rna_cross_stacking.py    # RNA cross-stacking
+    └── rna_coaxial_stacking.py  # RNA coaxial stacking
+examples/
+├── pytorch_demo.py      # End-to-end DNA demo (energy, forces, dynamics, BPTT)
+├── HAIRPIN/             # 18-nt DNA hairpin — topology, conf, input files
+└── RNA_MD/              # 132-nt single-stranded RNA — topology, conf, input files
+                         #   (generated with oxRNA2 MD at 25 °C, seq-dependent)
+```
+
+## Units
+
+oxDNA uses its own reduced unit system:
+
+| Quantity | Reduced unit |
+|----------|-------------|
+| Length | ~8.518 Å (≈ phosphate–phosphate distance) |
+| Energy | kT at 3000 K → `T_reduced = T_kelvin / 3000` |
+| Time | derived from length and energy units |
 
 ## References
 
-* Ouldridge et al., *J. Chem. Phys.* 134, 085101 (2011).
-* Sulc et al., *J. Chem. Phys.* 137, 135101 (2012) (Sequence dependence).
+- Ouldridge, Louis, Doye, *J. Chem. Phys.* **134**, 085101 (2011) — oxDNA1
+- Šulc, Romano, Ouldridge, Rovigatti, Doye, Louis, *J. Chem. Phys.* **137**, 135101 (2012) — oxDNA1 sequence-dependent parameters
+- Snodin, Randisi, Mosayebi, Šulc, Schreck, Romano, Ouldridge, Tsukanov, Nir, Louis, Doye, *J. Chem. Phys.* **142**, 234901 (2015) — oxDNA2
+- Šulc, Romano, Ouldridge, Doye, Louis, *J. Chem. Phys.* **140**, 235102 (2014) — oxRNA1
+- Matek, Šulc, Randisi, Doye, Louis, *J. Chem. Phys.* **143**, 243122 (2015) — oxRNA1 sequence-dependent parameters

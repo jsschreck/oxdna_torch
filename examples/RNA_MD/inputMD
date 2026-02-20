@@ -1,0 +1,35 @@
+####  PROGRAM PARAMETERS  ####
+backend = CPU
+#debug = 1
+#seed = 4982
+interaction_type = RNA2
+salt = 1.0
+####    SIM PARAMETERS    ####
+steps = 20000
+newtonian_steps = 103
+diff_coeff = 2.50
+#pt = 0.1
+thermostat = john
+
+T = 25C
+dt = 0.005
+verlet_skin = 0.05
+
+mismatch_repulsion = 1
+use_average_seq = 0
+seq_dep_file = rna_sequence_dependent_parameters.txt
+
+
+####    INPUT / OUTPUT    ####
+topology = prova.top
+conf_file = prova.conf
+trajectory_file = trajectory.dat
+refresh_vel = 1
+#log_file = log.dat
+no_stdout_energy = 0
+restart_step_counter = 0
+energy_file = energy.dat
+print_conf_interval = 1000000
+print_energy_every = 1000
+time_scale = linear
+external_forces = 0

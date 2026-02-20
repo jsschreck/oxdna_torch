@@ -93,7 +93,9 @@ class Topology:
         q_idx = self.bonded_pairs[:, 1]
         return self.base_types[p_idx], self.base_types[q_idx]
 
-    def compute_stacking_eps(self, temperature: float, seq_dependent: bool = True) -> Tensor:
+    def compute_stacking_eps(
+        self, temperature: float, seq_dependent: bool = True, use_oxdna2: bool = False
+    ) -> Tensor:
         """Compute sequence-dependent stacking epsilon for each bonded pair.
 
         In the C++ code, the stacking f1 call uses _f1(r, STCK_F1, q->type, p->type)
@@ -105,26 +107,33 @@ class Topology:
           - The stacking interaction is between the bases of p and q
           - In the C++ call: n3 = q->type, n5 = p->type
 
-        For sequence-averaged: eps = STCK_BASE_EPS + STCK_FACT_EPS * T
+        For sequence-averaged:
+          oxDNA1: eps = STCK_BASE_EPS_OXDNA  + STCK_FACT_EPS_OXDNA  * T
+          oxDNA2: eps = STCK_BASE_EPS_OXDNA2 + STCK_FACT_EPS_OXDNA2 * T
         For sequence-dependent: eps = STCK_EPS_SEQ[n3][n5] * (1 - fact + T*9*fact)
+          (same formula for both oxDNA1 and oxDNA2)
 
         Args:
             temperature: temperature in oxDNA reduced units
             seq_dependent: whether to use sequence-dependent parameters
+            use_oxdna2: if True, use oxDNA2 average-sequence constants
 
         Returns:
             (B,) stacking epsilon for each bonded pair
         """
         if not seq_dependent:
-            eps = C.STCK_BASE_EPS_OXDNA + C.STCK_FACT_EPS_OXDNA * temperature
+            if use_oxdna2:
+                eps = C.STCK_BASE_EPS_OXDNA2 + C.STCK_FACT_EPS_OXDNA2 * temperature
+            else:
+                eps = C.STCK_BASE_EPS_OXDNA + C.STCK_FACT_EPS_OXDNA * temperature
             return torch.full((self.n_bonded,), eps,
                           dtype=torch.float64, device=self.bonded_pairs.device)
 
         p_types, q_types = self.get_bonded_pair_base_types()
-    
-        # FIX: Move the constant tensor to the correct device BEFORE indexing
+
+        # Move the constant tensor to the correct device BEFORE indexing
         device = self.bonded_pairs.device
-        raw_eps = C.STCK_EPS_SEQ.to(device)[q_types, p_types] 
+        raw_eps = C.STCK_EPS_SEQ.to(device)[q_types, p_types]
         fact = C.STCK_FACT_EPS_SEQ
         eps = raw_eps * (1.0 - fact + temperature * 9.0 * fact)
         return eps
@@ -139,8 +148,12 @@ class Topology:
         factor = (1.0 - math.exp(-(C.STCK_RC - C.STCK_R0) * C.STCK_A)) ** 2
         return stacking_eps * factor
 
-    def compute_hbond_eps(self, seq_dependent: bool = True) -> Tensor:
+    def compute_hbond_eps(self, seq_dependent: bool = True, use_oxdna2: bool = False) -> Tensor:
         """Get the hydrogen bonding epsilon lookup.
+
+        Args:
+            seq_dependent: whether to use sequence-dependent parameters
+            use_oxdna2: if True, use HYDR_EPS_OXDNA2 for average-sequence model
 
         Returns:
             (4, 4) tensor of HB epsilon values indexed by [p_type, q_type]
@@ -150,9 +163,10 @@ class Topology:
             return C.HYDR_EPS_SEQ.clone().to(device)
         else:
             # Average model: all WC pairs get the same eps
+            hydr_eps = C.HYDR_EPS_OXDNA2 if use_oxdna2 else C.HYDR_EPS_OXDNA
             eps = torch.zeros(4, 4, dtype=torch.float64, device=device)
-            eps[0, 3] = eps[3, 0] = C.HYDR_EPS_OXDNA  # A-T
-            eps[1, 2] = eps[2, 1] = C.HYDR_EPS_OXDNA  # C-G
+            eps[0, 3] = eps[3, 0] = hydr_eps  # A-T
+            eps[1, 2] = eps[2, 1] = hydr_eps  # C-G
             return eps
 
     def to(self, device: torch.device) -> 'Topology':

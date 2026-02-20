@@ -4,6 +4,11 @@ Neighbor/pair finding for oxDNA interactions.
 Provides functions to find:
 1. Bonded pairs (from topology)
 2. Non-bonded pairs within cutoff distance
+
+Two backends are available for step 2:
+  - 'oxdna'      : built-in brute-force / cell-list (default, no extra deps)
+  - 'torchmdnet' : torchmd-net kernel (brute on CPU, Triton-fused on GPU)
+                   Requires: pip install torchmd-net
 """
 
 import torch
@@ -12,6 +17,106 @@ from typing import Optional, Tuple
 
 from .topology import Topology
 from . import constants as C
+
+
+# ---------------------------------------------------------------------------
+# Optional torchmd-net neighbor kernel
+# ---------------------------------------------------------------------------
+
+def _torchmdnet_available() -> bool:
+    try:
+        from torchmdnet.extensions.ops import get_neighbor_pairs_kernel  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def find_nonbonded_pairs_torchmdnet(
+    positions: Tensor,
+    topology: Topology,
+    box: Optional[Tensor] = None,
+    cutoff: Optional[float] = None,
+    strategy: str = 'brute',
+) -> Tensor:
+    """Find non-bonded pairs using the torchmd-net neighbor kernel.
+
+    Uses ``get_neighbor_pairs_kernel`` from torchmd-net, which dispatches to
+    a Triton-fused kernel on CUDA and a pure-PyTorch fallback on CPU.  The
+    output is converted to the same (P, 2) upper-triangular format as the
+    built-in backend so the rest of the code is unaffected.
+
+    Args:
+        positions: (N, 3) center-of-mass positions
+        topology:  Topology object (bonded pairs are excluded from the result)
+        box:       (3,) periodic box side lengths, or None
+        cutoff:    interaction cutoff distance (default: from constants)
+        strategy:  ``'brute'`` or ``'cell'`` — passed to the kernel.
+                   ``'brute'`` works on both CPU and GPU; ``'cell'`` requires
+                   CUDA and a periodic box.
+
+    Returns:
+        pairs: (P, 2) int64 tensor of non-bonded pair indices (i < j)
+
+    Raises:
+        ImportError: if torchmd-net is not installed
+    """
+    try:
+        from torchmdnet.extensions.ops import get_neighbor_pairs_kernel
+    except ImportError as exc:
+        raise ImportError(
+            "torchmd-net is required for the 'torchmdnet' neighbor backend. "
+            "Install with:  pip install torchmd-net"
+        ) from exc
+
+    if cutoff is None:
+        cutoff = C.compute_rcut()
+
+    N = positions.shape[0]
+    device = positions.device
+
+    # torchmd-net wants float32; we work in float64 — cast, compute, cast back.
+    pos_f32 = positions.detach().float()
+
+    # batch tensor: all zeros (single molecule)
+    batch = torch.zeros(N, dtype=torch.long, device=device)
+
+    # box_vectors: torchmd-net expects a (3, 3) diagonal matrix (or None-like).
+    # We support only orthogonal boxes (diagonal), matching our PBC convention.
+    use_periodic = box is not None
+    if use_periodic:
+        box_mat = torch.diag(box.float()).unsqueeze(0)  # (1, 3, 3)
+    else:
+        box_mat = torch.zeros(1, 3, 3, dtype=torch.float32, device=device)
+
+    # Conservative upper bound on number of pairs: N*(N-1)/2
+    max_num_pairs = max(1, N * (N - 1) // 2)
+
+    neighbors, _dist_vecs, _dists, num_pairs = get_neighbor_pairs_kernel(
+        strategy=strategy,
+        positions=pos_f32,
+        batch=batch,
+        box_vectors=box_mat,
+        use_periodic=use_periodic,
+        cutoff_lower=0.0,
+        cutoff_upper=float(cutoff),
+        max_num_pairs=max_num_pairs,
+        loop=False,           # no self-pairs
+        include_transpose=False,  # upper-triangular only (i < j after sort)
+        num_cells=0,          # auto
+    )
+    # neighbors: (2, max_num_pairs), padded with -1
+    # Trim to valid pairs
+    n_valid = int(num_pairs.item())
+    pairs_raw = neighbors[:, :n_valid].t()  # (P_raw, 2)
+
+    # Enforce i < j (torchmd-net returns lower triangular: i > j)
+    i = pairs_raw[:, 0]
+    j = pairs_raw[:, 1]
+    pairs = torch.stack([torch.minimum(i, j), torch.maximum(i, j)], dim=1)
+
+    # Exclude bonded pairs
+    pairs = _exclude_bonded(pairs, topology, N, device)
+    return pairs
 
 
 def compute_site_positions(
@@ -101,6 +206,7 @@ def find_nonbonded_pairs(
     box: Optional[Tensor] = None,
     cutoff: Optional[float] = None,
     method: str = 'auto',
+    backend: str = 'oxdna',
 ) -> Tensor:
     """Find non-bonded pairs within the interaction cutoff.
 
@@ -109,12 +215,23 @@ def find_nonbonded_pairs(
         topology: Topology object (to exclude bonded pairs)
         box: (3,) periodic box dimensions, or None for non-periodic
         cutoff: interaction cutoff distance (default: computed from constants)
-        method: 'auto', 'brute_force', or 'cell_list'
+        method: 'auto', 'brute_force', or 'cell_list'  (ignored when
+                backend='torchmdnet')
+        backend: neighbor-list backend to use:
+                 - ``'oxdna'``      : built-in implementation (default)
+                 - ``'torchmdnet'`` : torchmd-net kernel (requires
+                                     ``pip install torchmd-net``); uses Triton
+                                     on CUDA, pure-PyTorch on CPU
 
     Returns:
         pairs: (P, 2) int tensor of non-bonded pair indices, where
                pairs[:, 0] < pairs[:, 1] (upper triangular)
     """
+    if backend == 'torchmdnet':
+        return find_nonbonded_pairs_torchmdnet(
+            positions, topology, box, cutoff, strategy='brute'
+        )
+
     if cutoff is None:
         cutoff = C.compute_rcut()
 

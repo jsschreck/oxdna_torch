@@ -29,6 +29,7 @@ def coaxial_stacking_energy(
     nonbonded_pairs: Tensor,
     box: Optional[Tensor] = None,
     params: Optional[Dict[str, Tensor]] = None,
+    oxdna2: bool = False,
 ) -> Tensor:
     """Compute coaxial stacking energy for all non-bonded pairs.
 
@@ -39,6 +40,7 @@ def coaxial_stacking_energy(
         nonbonded_pairs: (P, 2) non-bonded pair indices
         box: (3,) periodic box dimensions, or None
         params: optional dict from ParameterStore.as_dict() for learnable params
+        oxdna2: if True, use oxDNA2 coaxial stacking (modified K and theta1 function)
 
     Returns:
         Scalar total coaxial stacking energy
@@ -95,11 +97,31 @@ def coaxial_stacking_energy(
     cosphi3 = dot(r_stack_dir, r_backref_cross_a1, dim=-1)
 
     # f2 radial (coaxial stacking type = 1)
-    val_f2 = f2(r_stack_mod, C.CXST_F2, params=params)
+    # oxDNA2 uses CXST_K_OXDNA2 = 58.5 instead of CXST_K_OXDNA = 46.0
+    if oxdna2 and params is None:
+        # Build a minimal params override just for the K value
+        import copy
+        _params2 = {
+            'f2_K': C.F2_K.clone().to(positions.device),
+            'f2_R0': C.F2_R0.clone().to(positions.device),
+            'f2_RC': C.F2_RC.clone().to(positions.device),
+            'f2_BLOW': C.F2_BLOW.clone().to(positions.device),
+            'f2_BHIGH': C.F2_BHIGH.clone().to(positions.device),
+            'f2_RLOW': C.F2_RLOW.clone().to(positions.device),
+            'f2_RHIGH': C.F2_RHIGH.clone().to(positions.device),
+            'f2_RCLOW': C.F2_RCLOW.clone().to(positions.device),
+            'f2_RCHIGH': C.F2_RCHIGH.clone().to(positions.device),
+        }
+        _params2['f2_K'] = _params2['f2_K'].clone()
+        _params2['f2_K'][C.CXST_F2] = C.CXST_K_OXDNA2
+        val_f2 = f2(r_stack_mod, C.CXST_F2, params=_params2)
+    else:
+        val_f2 = f2(r_stack_mod, C.CXST_F2, params=params)
 
     # Angular modulations
-    # theta1 uses special cxst function: f4(acos(t)) + f4(2pi - acos(t))
-    val_f4t1 = f4_of_cos_cxst_t1(cost1, C.CXST_F4_THETA1, params=params)
+    # oxDNA1 theta1: f4(acos(t)) + f4(2pi - acos(t))
+    # oxDNA2 theta1: f4(acos(t)) + f4_pure_harmonic(acos(t))  [T0 changed to pi-0.25]
+    val_f4t1 = f4_of_cos_cxst_t1(cost1, C.CXST_F4_THETA1, params=params, oxdna2=oxdna2)
 
     val_f4t4 = f4_of_cos(cost4, C.CXST_F4_THETA4, params=params)
 

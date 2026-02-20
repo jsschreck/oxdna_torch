@@ -93,7 +93,7 @@ class TestCUDAEnergy:
         )
         e_cpu = model_cpu(s_cpu).item()
 
-        # GPU energy — create a fresh model to avoid shared topology
+        # GPU energy - create a fresh model to avoid shared topology
         topology2, state2 = load_system(HAIRPIN_TOP, HAIRPIN_CONF)
         model_gpu = OxDNAEnergy(topology2, temperature=T_334K, seq_dependent=False)
         model_gpu = model_gpu.to('cuda')

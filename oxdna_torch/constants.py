@@ -150,6 +150,12 @@ CXST_BHIGH = -2.13158
 CXST_RHIGH = 0.58
 CXST_RCHIGH = 0.6222222
 
+# oxDNA2 coaxial stacking theta1 parameters (pure-harmonic correction)
+# Source: oxDNA model.h CXST_THETA1_T0_OXDNA2, CXST_THETA1_SA, CXST_THETA1_SB
+CXST_THETA1_T0_OXDNA2 = math.pi - 0.25
+CXST_THETA1_SA = 20.0
+CXST_THETA1_SB = math.pi - 0.1 * (math.pi - (math.pi - 0.25))  # pi - 0.025
+
 # f4 angular indices for coaxial stacking
 CXST_F4_THETA1 = 10
 CXST_F4_THETA4 = 11
@@ -159,6 +165,14 @@ CXST_F4_THETA6 = 12  # same mesh as theta5
 # f5 azimuthal indices for coaxial stacking
 CXST_F5_PHI3 = 2
 CXST_F5_PHI4 = 3
+
+# ============================================================
+# Debye-Hückel electrostatics (oxDNA2 only)
+# ============================================================
+DH_PREFACTOR = 0.0543          # Q: overall strength prefactor
+DH_LAMBDAFACTOR = 0.3616455    # lambda_0 at T=300K, I=1M (in oxDNA length units)
+DH_T_REF = 0.1                 # reference temperature (300K in oxDNA units = 300/3000)
+# Default salt: 0.5 M (set at runtime via OxDNA2Energy salt_concentration arg)
 
 # ============================================================
 # f4 angular function parameters (13 parameter sets, indexed 0-12)
@@ -360,11 +374,26 @@ BASE_INT_TO_CHAR = {0: 'A', 1: 'C', 2: 'G', 3: 'T'}
 # ============================================================
 # Cutoff distance
 # ============================================================
-def compute_rcut(grooving: bool = False) -> float:
-    """Compute the interaction cutoff distance."""
+def compute_rcut(grooving: bool = False, dh_rc: float = 0.0) -> float:
+    """Compute the interaction cutoff distance.
+
+    Args:
+        grooving: whether to use major-minor groove backbone positions
+        dh_rc: Debye-Hückel cutoff radius (0 = no DH term). When > 0,
+               the cutoff is extended to cover backbone–backbone DH interactions.
+    """
     if grooving:
         rcutback = 2 * math.sqrt(POS_MM_BACK1**2 + POS_MM_BACK2**2) + EXCL_RC1
     else:
         rcutback = 2 * abs(POS_BACK) + EXCL_RC1
     rcutbase = 2 * abs(POS_BASE) + HYDR_RCHIGH
-    return max(rcutback, rcutbase)
+    rcut = max(rcutback, rcutbase)
+
+    if dh_rc > 0.0:
+        if grooving:
+            debyecut = 2 * math.sqrt(POS_MM_BACK1**2 + POS_MM_BACK2**2) + dh_rc
+        else:
+            debyecut = 2 * abs(POS_BACK) + dh_rc
+        rcut = max(rcut, debyecut)
+
+    return rcut

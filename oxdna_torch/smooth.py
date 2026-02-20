@@ -215,25 +215,60 @@ def f4_of_cos(cos_theta: Tensor, f4_type: int, params: Optional[Dict[str, Tensor
     return f4(theta, f4_type, params=params)
 
 
-def f4_of_cos_cxst_t1(cos_theta: Tensor, f4_type: int, params: Optional[Dict[str, Tensor]] = None) -> Tensor:
+def f4_pure_harmonic(theta: Tensor, sa: float, sb: float) -> Tensor:
+    """Pure-harmonic correction term used by oxDNA2 CXST theta1.
+
+    Computes:  SA * max(theta - SB, 0)^2
+
+    This adds a one-sided harmonic ramp above SB that smoothly extends
+    the f4(theta1) well to larger angles without disrupting the potential.
+    Source: DNA2Interaction::_f4_pure_harmonic
+
+    Args:
+        theta: (...) angle in radians
+        sa: harmonic prefactor  (CXST_THETA1_SA = 20.0)
+        sb: onset angle in radians  (CXST_THETA1_SB = pi - 0.025)
+
+    Returns:
+        (...) correction values (>= 0)
+    """
+    tt0 = theta - sb
+    return torch.where(tt0 > 0.0, sa * tt0 * tt0, torch.zeros_like(theta))
+
+
+def f4_of_cos_cxst_t1(
+    cos_theta: Tensor,
+    f4_type: int,
+    params: Optional[Dict[str, Tensor]] = None,
+    oxdna2: bool = False,
+) -> Tensor:
     """Special f4 for coaxial stacking theta1.
 
-    The C++ code uses _fakef4_cxst_t1 which computes:
-      f4(acos(t)) + f4(2*pi - acos(t))
+    oxDNA1:
+      _fakef4_cxst_t1(t) = f4(acos(t)) + f4(2*pi - acos(t))
 
-    This allows the coaxial stacking interaction at both theta and 2*pi - theta.
+    oxDNA2:
+      _fakef4_cxst_t1(t) = f4(acos(t)) + f4_pure_harmonic(acos(t))
+
+    In oxDNA2 the T0 for index 10 is changed to pi-0.25 (set at model level)
+    and the second term is the pure-harmonic correction, not the mirror image.
 
     Args:
         cos_theta: (...) cosine of angle
         f4_type: should be CXST_F4_THETA1 = 10
         params: optional dict from ParameterStore.as_dict() for learnable params
+        oxdna2: if True, use oxDNA2 formula (f4 + pure_harmonic)
 
     Returns:
         (...) modulation values
     """
     import math
     from .utils import safe_acos
+    from . import constants as C
     theta = safe_acos(cos_theta)
+    if oxdna2:
+        return (f4(theta, f4_type, params=params)
+                + f4_pure_harmonic(theta, C.CXST_THETA1_SA, C.CXST_THETA1_SB))
     return f4(theta, f4_type, params=params) + f4(2.0 * math.pi - theta, f4_type, params=params)
 
 
