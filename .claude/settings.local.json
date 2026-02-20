@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python:*)",
+      "Bash(pip install:*)",
+      "Bash(head -30 grep -n \"BACK\\\\|int_centers\\\\[.*BACK\" /Users/schreck/Downloads/oxdna_torch/oxDNA/src/Particles/DNANucleotide.cpp)",
+      "Bash(head:*)",
+      "Bash(find /Users/schreck/Downloads/oxdna_torch/oxDNA -name \"DNANucleotide*\" grep -rn \"int_centers\\\\|POS_MM_BACK\\\\|_grooving\" /Users/schreck/Downloads/oxdna_torch/oxDNA/src/Interactions/DNAInteraction.cpp)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:torchmd-net.readthedocs.io)",
+      "Bash(# Check if we have a reference energy file or last_conf for the RNA example cat /Users/schreck/Downloads/oxDNA/examples/RNA_DUPLEX_MELT/last_conf.dat)",
+      "Bash(# Check what base type encoding the C++ oxDNA uses for RNA grep -r \"\"base_type\\\\|base_int\\\\|int_to_base\\\\|_base\"\" /Users/schreck/Downloads/oxDNA/src/Nucleotide.h)",
+      "Bash(# Check a DNA example to see position scale head -5 /Users/schreck/Downloads/oxDNA/examples/HAIRPIN/init.conf || head -5 /Users/schreck/Downloads/oxDNA/examples/*/init.conf)",
+      "Bash(git stash:*)"
+    ]
+  }
+}
